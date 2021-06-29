@@ -1,0 +1,372 @@
+#!/usr/bin/python3
+#  makedaisy.py -  Program to generate DAISY metadata for LibriVox files.
+
+import   os
+import   sys
+import   shutil
+import   fnmatch
+import   time
+import   html
+
+# TAGREADER = sys.argv[0][:sys.argv[0].rfind ("\\")] + "\\id3dump"
+# TIDYMP3   = sys.argv[0][:sys.argv[0].rfind ("\\")] + "\\lame -a -t --strictly-enforce-ISO -b56 --resample 44.1"
+TAGREADER = os.path.join (os.path.dirname (sys.argv[0]), "id3dump")
+TIDYMP3   = "lame -a -t --strictly-enforce-ISO -b56 --resample 44.1"
+bShortStory = 0
+bIgnoreTracks = 0
+bSortFileName = 0
+
+def ReadTags (tags, p1):
+   sLine = p1.readline ()
+   while ( sLine != "" ):
+      # if ( ( sLine[0] >= "a" ) and ( sLine[0] <= "z" ) ):
+      if ( sLine.count (":") > 0 ):
+         tag, value = sLine.split (":", 1)
+         tag = tag.strip ()
+         value = value.strip ()
+         if ( len(value) > 0 ):
+            if ( ( value[0] == "\"" ) and ( value[-1] == "\"" ) ):
+               value = value[1:-1]
+            if ( len (value) > 0 ):
+               tags[tag] = value
+      sLine = p1.readline ()
+   p1.close ()
+
+#  Read ID3 tags from mp3 file.
+def GetTags (sFile):
+   tags = {}
+   ReadTags (tags, os.popen (TAGREADER + " \"" + sFile + "\""))
+   #  Get tags from text file if ID3 tags are missing or corrupt.
+   sTags = sFile[:-4] + ".txt"
+   if ( os.path.exists (sTags) ):
+      ReadTags (tags, file (sTags))
+   return tags
+
+#  Convert a formatted time string into integer seconds.
+def ToSecs (sTime):
+   parts = sTime.split (":")
+   if ( len(parts) == 1 ):
+      return   int (parts[0])
+   elif ( len(parts) == 2 ):
+      return   60 * int (parts[0]) + int (parts[1])
+   else:
+      return   3600 * int (parts[0]) + 60 * int (parts[1]) + int (parts[2])
+
+#  Turn seconds into a hh:mm:ss.sss string.
+def FmtSecs (secs):
+   sc = secs
+   hr =  int (sc / 3600)
+   sc -= 3600 * hr
+   mn =  int (sc / 60)
+   sc -= 60 * mn
+   return   "%d:%2.2d:%06.3f" % (hr, mn, sc)
+
+#  Turn seconds into a hh:mm:ss string.
+def FmtIntSecs (secs):
+   sc = int( secs + 0.5 )
+   hr =  int (sc / 3600)
+   sc -= 3600 * hr
+   mn =  int (sc / 60)
+   sc -= 60 * mn
+   return   "%d:%2.2d:%2.2d" % (hr, mn, sc)
+
+#  Class to define one chapter of a book.
+class Chapter:
+   #  Construct chapter definition from ID3 tags in an mp3 file.
+   def __init__ (self, dir, sFile):
+      print ("Scanning file", sFile)
+      self.file = sFile
+      self.srcdir = dir
+      self.position = 0
+      self.title = sFile
+      tags = GetTags (os.path.join (dir, sFile))
+      if ( "Album" in tags ):
+         self.book = tags["Album"]
+      if ( "Title" in tags ):
+         self.title = tags["Title"]
+      if ( "Artist" in tags ):
+         self.author = tags["Artist"]
+      if ( "Track" in tags ):
+         self.position = tags["Track"]
+      self.duration = float (tags["Duration"][:-1])
+
+   #  Sort chapters according to track number (if defined), otherwise title.
+   def Order (self):
+      if ( not bIgnoreTracks ):
+         return self.position
+      elif ( bSortFileName ):
+         return self.file
+      return self.title
+   
+   # def Order (ch1, ch2):
+   #    if ( not bIgnoreTracks ):
+   #       if ( ch1.position < ch2.position ):
+   #          return -1
+   #       if ( ch1.position > ch2.position ):
+   #          return 1
+   #    if ( bSortFileName ):
+   #       if ( ch1.file < ch2.file ):
+   #          return -1
+   #       if ( ch1.file > ch2.file ):
+   #          return 1
+   #    if ( ch1.title < ch2.title ):
+   #       return -1
+   #    if ( ch1.title > ch2.title ):
+   #       return 1
+   #    return 0
+
+   #  Name of SMIL file for this chapter.
+   def SMIL (self):
+      return self.file.replace (".mp3", ".smil")
+
+   #  Entry in the ncc.html file for the chapter.
+   def NccRef (self):
+      if ( bShortStory ):
+         return "<h2 id=\"Chapter_" + str (self.position) + "\">\n" \
+            + "<a href=\"" + self.SMIL () + "#Read_" + str (self.position) + "\">\n" \
+            + "\"" + html.escape (self.title) + "\" by " + html.escape (self.author) \
+            + "\n</a>\n</h2>\n"
+      else:
+         return "<h2 id=\"Chapter_" + str (self.position) + "\">\n" \
+            + "<a href=\"" + self.SMIL () + "#Read_" + str (self.position) + "\">\n" \
+            + html.escape (self.title) \
+            + "\n</a>\n</h2>\n"
+
+   #  Entry in the master.smil file for the chapter.
+   def SmilRef (self):
+      return "<ref title=\"" + self.title + "\" src=\"" + self.SMIL () \
+         + "\" id=\"Master_" + str (self.position) + "\" />\n"
+
+   #  Write the chapter SMIL file.
+   def MakeSmil (self, dir, timeTotal):
+      f  =  open (os.path.join (dir, self.SMIL ()), "w+")
+      f.write ("<?xml version=\"1.0\" encoding=\"iso-8859-1\"?>\n")
+      f.write ("<!DOCTYPE smil PUBLIC \"-//W3C//DTD SMIL 1.0//EN\" \"http://www.w3.org/TR/REC-SMIL/SMIL10.dtd\">\n")
+      f.write ("<smil>\n")
+      f.write ("<head>\n")
+      f.write ("<meta name=\"dc:format\" content=\"Daisy 2.02\" />\n")
+      f.write ("<meta name=\"dc:title\" content=\"" + html.escape (self.book, 1) + "\" />\n")
+      f.write ("<meta name=\"title\" content=\"" + html.escape (self.title, 1) + "\" />\n")
+      f.write ("<meta name=\"dc:identifier\" content=\"LibriVox: " + html.escape (self.book, 1) + "\" />\n")
+      f.write ("<meta name=\"ncc:totalElapsedTime\" content=\"" + FmtSecs (timeTotal) + "\" />\n")
+      f.write ("<meta name=\"ncc:timeInThisSmil\" content=\"" + FmtSecs (self.duration) + "\" />\n")
+      f.write ("<layout><region id=\"txtView\" /></layout>\n")
+      f.write ("</head>\n")
+      f.write ("<body>\n")
+      f.write ("<seq dur=\"" + ("%5.3f"%self.duration) + "s\">\n")
+      f.write ("<par endsync=\"last\" id=\"Read_" + str(self.position) + "\">\n")
+      f.write ("<text src=\"ncc.html#Chapter_" + str(self.position) + "\" id=\"Text_" + str(self.position) + "\" />\n")
+      f.write ("<audio src=\"" + self.file + "\" id=\"Audio_" + str(self.position) \
+         + "\" clip-begin=\"npt=0.000s\" clip-end=\"npt=" + ("%5.3f"%self.duration) + "s\" />\n")
+      f.write ("</par>\n")
+      f.write ("</seq>\n")
+      f.write ("</body>\n")
+      f.write ("</smil>\n")
+      f.close ()
+
+   def CopyClean (self, dir):
+      srcPath = os.path.join (self.srcdir, self.file)
+      dstPath = os.path.join (dir, self.file)
+      # if ( dir <> self.srcdir ):
+      #    shutil.copy (srcPath, dstPath)
+      # os.system (TIDYMP3 + " " + dstPath + " >nul")
+      if ( not os.path.exists (dstPath) ):
+         os.system (TIDYMP3 + " " + srcPath + " " + dstPath)
+
+
+#  Class to define a whole book.
+class Book:
+   #  Construct the book by scanning all the mp3 files in a directory.
+   def __init__ (self, dir):
+      print ("Scanning directory", dir)
+      self.contents = []
+      files = os.listdir (dir)
+      for file in files:
+         if ( fnmatch.fnmatch (file, "*.mp3") ):
+            self.contents.append (Chapter (dir, file))
+      print ("Sorting contents")
+      self.contents.sort (key=Chapter.Order)
+      self.title = self.contents[0].book
+      if ( os.path.exists ("daisy.txt") ):
+         self.BookInfo ("daisy.txt")
+      else:
+         self.LibriVoxInfo ()
+      iPos = 0
+      for ch in self.contents:
+         iPos = iPos + 1
+         ch.position =  iPos
+         ch.book = self.title
+
+   def LibriVoxInfo (self):
+      self.identifier = "LibriVox: " + self.title
+      self.creator = "librivox.org"
+      self.publisher = "librivox.org"
+      self.rights = "This is a LibriVox recording. All LibriVox recordings are in the public domain. For more information, or to volunteer, please visit librivox.org"
+      self.sourcePublisher = "Project Gutenberg"
+      self.sourceEdition = "Public Domain"
+      self.narrator = "LibriVox Reader"
+
+   def BookInfo (self, sInfo):
+      tags = {}
+      ReadTags (tags, file (sInfo))
+      if ( "Identifier" in tags ):
+         self.identifier = tags["Identifier"]
+      if ( "Title" in tags ):
+         self.title = tags["Title"]
+      if ( "Creator" in tags ):
+         self.creator = tags["Creator"]
+      if ( "Publisher" in tags ):
+         self.publisher = tags["Publisher"]
+      if ( "Rights" in tags ):
+         self.rights = tags["Rights"]
+      if ( "Source publisher" in tags ):
+         self.sourcePublisher = tags["Source publisher"]
+      if ( "Source edition" in tags ):
+         self.sourceEdition = tags["Source edition"]
+      if ( "Narrator" in tags ):
+         self.narrator = tags["Narrator"]
+
+   #  Calculate total duration of book from chapter durations.
+   def TotalDuration (self):
+      duration = 0
+      for ch in self.contents:
+         duration += ch.duration
+      return   duration
+
+   #  Write the ncc.html file.
+   def MakeNcc (self, dir):
+      f  =  open (os.path.join (dir, "ncc.html"), "w+")
+      f.write ("<?xml version=\"1.0\" encoding=\"iso-8859-1\"?>\n")
+      f.write ("<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Transitional//EN\" \"http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd\">\n")
+      f.write ("<html xmlns=\"http://www.w3.org/1999/xhtml\" xml:lang=\"en\" lang=\"en\">\n")
+      f.write ("<head>\n")
+      f.write ("<title>" + html.escape (self.title) + "</title>\n")
+      f.write ("<meta http-equiv=\"Content-type\" content=\'text/html; charset=\"iso-8859-1\"\' />\n")
+      f.write ("<meta name=\"dc:creator\" content=\"" + html.escape (self.creator, 1) + "\" />\n")
+      f.write ("<meta name=\"dc:date\" content=\"" + time.strftime ("%Y-%m-%d") + "\" scheme=\"yyyy-mm-dd\" />\n")
+      f.write ("<meta name=\"dc:format\" content=\"Daisy 2.02\" />\n")
+      f.write ("<meta name=\"dc:identifier\" content=\"" + html.escape (self.identifier, 1) + "\" />\n")
+      f.write ("<meta name=\"dc:language\" content=\"en\" />\n")
+      f.write ("<meta name=\"dc:publisher\" content=\"" + html.escape (self.publisher, 1) + "\" />\n")
+      f.write ("<meta name=\"dc:rights\" content=\"" + html.escape (self.rights, 1) + "\" />\n")
+      f.write ("<meta name=\"dc:title\" content=\"" + html.escape (self.title, 1) + "\" />\n")
+      f.write ("<meta name=\"ncc:charset\" content=\"iso-8859-1\" />\n")
+      f.write ("<meta name=\"ncc:multimediaType\" content=\"audioNcc\" />\n")
+      f.write ("<meta name=\"ncc:pageFront\" content=\"0\" />\n")
+      f.write ("<meta name=\"ncc:pageNormal\" content=\"0\" />\n")
+      f.write ("<meta name=\"ncc:pageSpecial\" content=\"0\" />\n")
+      f.write ("<meta name=\"ncc:tocItems\" content=\"" + str(len (self.contents) + 1) + "\" />\n")
+      f.write ("<meta name=\"ncc:depth\" content=\"2\" />\n")
+      f.write ("<meta name=\"ncc:files\" content=\"" + str(2 * len (self.contents) + 3) + "\" />\n")
+      f.write ("<meta name=\"ncc:maxPageNormal\" content=\"0\" />\n")
+      f.write ("<meta name=\"dc:source\" content=\"" + self.title + "\" />\n")
+      f.write ("<meta name=\"ncc:sourcePublisher\" content=\"" + html.escape (self.sourcePublisher, 1) + "\" />\n")
+      f.write ("<meta name=\"ncc:sourceDate\" content=\"" + time.strftime ("%Y-%m-%d") + "\" scheme=\"yyyy-mm-dd\" />\n")
+      f.write ("<meta name=\"ncc:sourceEdition\" content=\"" + html.escape (self.sourceEdition, 1) + "\" />\n")
+      f.write ("<meta name=\"ncc:narrator\" content=\"" + html.escape (self.narrator, 1) + "\" />\n")
+      f.write ("<meta name=\"dc:subject\" content=\"" + html.escape (self.title, 1) + "\" />\n")
+      f.write ("<meta name=\"ncc:totalTime\" content=\"" + FmtIntSecs (self.TotalDuration ()) + "\" scheme=\"hh:mm:ss\" />\n")
+      f.write ("</head>\n")
+      f.write ("<body>\n")
+      f.write ("<h1 class=\"title\" id=\"Title\"><a href=\"title.smil#Read_Title\">" \
+         + html.escape (self.title) + "</a></h1>\n")
+      for ch in self.contents:
+         f.write (ch.NccRef ())
+      f.write ("</body>\n")
+      f.write ("</html>\n")
+
+   #  Write the title.smil file.
+   def MakeTitleSmil (self, dir):
+      f  =  open (os.path.join (dir, "title.smil"), "w+")
+      f.write ("<?xml version=\"1.0\" encoding=\"iso-8859-1\"?>\n")
+      f.write ("<!DOCTYPE smil PUBLIC \"-//W3C//DTD SMIL 1.0//EN\" \"http://www.w3.org/TR/REC-SMIL/SMIL10.dtd\">\n")
+      f.write ("<smil>\n")
+      f.write ("<head>\n")
+      f.write ("<meta name=\"dc:format\" content=\"Daisy 2.02\" />\n")
+      f.write ("<meta name=\"dc:title\" content=\"" + html.escape (self.title, 1) + "\" />\n")
+      f.write ("<meta name=\"title\" content=\"" + html.escape (self.title, 1) + "\" />\n")
+      f.write ("<meta name=\"dc:identifier\" content=\"" + html.escape (self.identifier, 1) + "\" />\n")
+      f.write ("<meta name=\"ncc:totalElapsedTime\" content=\"0:00:00\" />\n")
+      f.write ("<meta name=\"ncc:timeInThisSmil\" content=\"0:00:00\" />\n")
+      f.write ("<layout><region id=\"txtView\" /></layout>\n")
+      f.write ("</head>\n")
+      f.write ("<body>\n")
+      f.write ("<seq dur=\"0.000s\">\n")
+      f.write ("<par endsync=\"last\" id=\"Read_Title\">\n")
+      f.write ("<text src=\"ncc.html#Title\" id=\"Text_Title\" />\n")
+      f.write ("</par>\n")
+      f.write ("</seq>\n")
+      f.write ("</body>\n")
+      f.write ("</smil>\n")
+      f.close ()
+
+   #  Write the master.smil file.
+   def MakeMasterSmil (self, dir):
+      f  =  open (os.path.join (dir, "master.smil"), "w+")
+      f.write ("<?xml version=\"1.0\" encoding=\"iso-8859-1\"?>\n")
+      f.write ("<!DOCTYPE smil PUBLIC \"-//W3C//DTD SMIL 1.0//EN\" \"http://www.w3.org/TR/REC-SMIL/SMIL10.dtd\">\n")
+      f.write ("<smil>\n")
+      f.write ("<head>\n")
+      f.write ("<meta name=\"dc:format\" content=\"Daisy 2.02\" />\n")
+      f.write ("<meta name=\"dc:title\" content=\"" + html.escape (self.title, 1) + "\" />\n")
+      f.write ("<meta name=\"dc:identifier\" content=\"" + html.escape (self.identifier, 1) + "\" />\n")
+      f.write ("<meta name=\"ncc:timeInThisSmil\" content=\"" + FmtSecs (self.TotalDuration ()) + "\" />\n")
+      f.write ("<layout><region id=\"txtView\" /></layout>\n")
+      f.write ("</head>\n")
+      f.write ("<body>\n")
+      f.write ("<ref title=\"" + html.escape (self.title, 1) + "\" src=\"title.smil\" id=\"Master_Title\" />\n")
+      for ch in self.contents:
+         f.write (ch.SmilRef ())
+      f.write ("</body>\n")
+      f.write ("</smil>\n")
+      f.close ()
+
+   #  Create all the DAISY metadata for the book.
+   def MakeDaisy (self, dir):
+      print ("Creating DAISY metadata")
+      print ("Title: \"" + self.title + "\"")
+      self.MakeNcc (dir)
+      self.MakeTitleSmil (dir)
+      print ("Contents:")
+      timeTotal = 0
+      for ch in self.contents:
+         print ("   ", ch.title)
+         ch.CopyClean (dir)
+         ch.MakeSmil (dir, timeTotal)
+         timeTotal += ch.duration
+      self.MakeMasterSmil (dir)
+
+#  Process command line arguments.
+dirSrc = "."
+dirDst = "Daisy"
+iPar = 0
+i = 1
+while ( i < len(sys.argv) ):
+   if ( sys.argv[i].lower () == "-ss" ):
+      bShortStory = 1
+      print ("Short Story Collection")
+   elif ( sys.argv[i].lower () == "-it" ):
+      bIgnoreTracks = 1
+      print ("Ignore Track Numbers")
+   elif ( sys.argv[i].lower () == "-sf" ):
+      bSortFileName = 1
+      print ("Sort on file names")
+   elif ( iPar == 0 ):
+      dirSrc = sys.argv[i]
+      iPar = 1
+   elif ( iPar == 1 ):
+      dirDst = sys.argv[i]
+      iPar = 2
+   else:
+      print ("Unrecognised parameter:", sys.argv[i])
+      sys.exit (1)
+   i = i + 1
+
+#  Create output directory
+if ( iPar < 2 ):
+   dirDst = os.path.join (dirSrc, "Daisy")
+if ( not os.path.isdir (dirDst) ):
+   os.makedirs (dirDst)
+
+#  Create the DAISY files.
+Book (dirSrc).MakeDaisy (dirDst)
